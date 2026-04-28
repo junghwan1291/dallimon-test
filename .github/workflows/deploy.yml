@@ -23,6 +23,6 @@ jobs:
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          projectName: 'dallimmon' # Cloudflare Pages 프로젝트 이름을 입력하세요
+          projectName: 'dallimon-test' # Cloudflare Pages 프로젝트 이름과 일치시켰습니다
           directory: 'build/web'
           gitHubToken: ${{ secrets.GITHUB_TOKEN }}
