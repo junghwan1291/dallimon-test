@@ -47,55 +47,60 @@ class _SplashScreenState extends State<SplashScreen>
           ),
         ),
         child: Center(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            children: [
-              // Sparkles
-              FadeTransition(
-                opacity: _fade,
-                child: const Text('✦  ✦  ✦  ✦  ✦',
-                    style: TextStyle(color: AppColors.accent, fontSize: 14, letterSpacing: 4)),
+          child: SingleChildScrollView(
+            child: Padding(
+              padding: const EdgeInsets.symmetric(vertical: 20),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  // Sparkles
+                  FadeTransition(
+                    opacity: _fade,
+                    child: const Text('✦  ✦  ✦  ✦  ✦',
+                        style: TextStyle(color: AppColors.accent, fontSize: 14, letterSpacing: 4)),
+                  ),
+                  const SizedBox(height: 24),
+                  // Egg animation
+                  ScaleTransition(
+                    scale: _scale,
+                    child: const Text('🐣', style: TextStyle(fontSize: 80)),
+                  ),
+                  const SizedBox(height: 32),
+                  // Title
+                  FadeTransition(
+                    opacity: _fade,
+                    child: const Text('달리몬',
+                        style: TextStyle(
+                          color: AppColors.text,
+                          fontSize: 48,
+                          fontWeight: FontWeight.w900,
+                          letterSpacing: 2,
+                        )),
+                  ),
+                  const SizedBox(height: 8),
+                  FadeTransition(
+                    opacity: _fade,
+                    child: const Text('DALLIMON  ·  v5.0',
+                        style: TextStyle(color: AppColors.textSub, fontSize: 13, letterSpacing: 3)),
+                  ),
+                  const SizedBox(height: 28),
+                  FadeTransition(
+                    opacity: _fade,
+                    child: const Text(
+                      '걷기로 키우고\nNFC로 함께 싸우는\n세대 공감 산책 RPG',
+                      textAlign: TextAlign.center,
+                      style: TextStyle(color: AppColors.textSub, fontSize: 15, height: 1.8),
+                    ),
+                  ),
+                  const SizedBox(height: 48),
+                  // Loading dots
+                  FadeTransition(
+                    opacity: _fade,
+                    child: const _LoadingDots(),
+                  ),
+                ],
               ),
-              const SizedBox(height: 24),
-              // Egg animation
-              ScaleTransition(
-                scale: _scale,
-                child: const Text('🐣', style: TextStyle(fontSize: 80)),
-              ),
-              const SizedBox(height: 32),
-              // Title
-              FadeTransition(
-                opacity: _fade,
-                child: const Text('달리몬',
-                    style: TextStyle(
-                      color: AppColors.text,
-                      fontSize: 48,
-                      fontWeight: FontWeight.w900,
-                      letterSpacing: 2,
-                    )),
-              ),
-              const SizedBox(height: 8),
-              FadeTransition(
-                opacity: _fade,
-                child: const Text('DALLIMON  ·  v5.0',
-                    style: TextStyle(color: AppColors.textSub, fontSize: 13, letterSpacing: 3)),
-              ),
-              const SizedBox(height: 28),
-              FadeTransition(
-                opacity: _fade,
-                child: const Text(
-                  '걷기로 키우고\nNFC로 함께 싸우는\n세대 공감 산책 RPG',
-                  textAlign: TextAlign.center,
-                  style: TextStyle(color: AppColors.textSub, fontSize: 15, height: 1.8),
-                ),
-              ),
-              const SizedBox(height: 48),
-              // Loading dots
-              FadeTransition(
-                opacity: _fade,
-                child: const _LoadingDots(),
-              ),
-            ],
+            ),
           ),
         ),
       ),
