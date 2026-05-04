@@ -3,6 +3,8 @@ import 'dart:convert';
 import 'dart:math';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:firebase_auth/firebase_auth.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
 import '../domain/dallimmon.dart';
 
 // ── Step milestones (GDD v5) ─────────────────────────────
@@ -128,6 +130,60 @@ class GameState {
         pvpPoints: pvpPoints ?? this.pvpPoints,
         victoryTokens: victoryTokens ?? this.victoryTokens,
       );
+      
+  Map<String, dynamic> toJson() => {
+    'onboardingDone': onboardingDone,
+    'playerLevel': playerLevel,
+    'playerExp': playerExp,
+    'totalSteps': totalSteps,
+    'todaySteps': todaySteps,
+    'normalTickets': normalTickets,
+    'highestDungeonCleared': highestDungeonCleared,
+    'dungeonClearCount': dungeonClearCount,
+    'dungeonClearedToday': dungeonClearedToday,
+    'idleCollectedToday': idleCollectedToday,
+    'newDallimmonToday': newDallimmonToday,
+    'questResetDate': questResetDate,
+    'dallimmons': dallimmons.map((d) => d.toJson()).toList(),
+    'activeDallimmonIndex': activeDallimmonIndex,
+    'eggs': eggs.map((e) => e.toJson()).toList(),
+    'partyIndices': partyIndices,
+    'pvpPoints': pvpPoints,
+    'victoryTokens': victoryTokens,
+  };
+
+  factory GameState.fromJson(Map<String, dynamic> json) {
+    final dallimmons = (json['dallimmons'] as List<dynamic>?)
+            ?.map((d) => OwnedDallimmon.fromJson(d as Map<String, dynamic>))
+            .toList() ??
+        [];
+    return GameState(
+      onboardingDone: (json['onboardingDone'] as bool?) ?? false,
+      playerLevel: (json['playerLevel'] as int?) ?? 1,
+      playerExp: (json['playerExp'] as int?) ?? 0,
+      totalSteps: (json['totalSteps'] as int?) ?? 0,
+      todaySteps: (json['todaySteps'] as int?) ?? 0,
+      normalTickets: (json['normalTickets'] as int?) ?? 3,
+      highestDungeonCleared: (json['highestDungeonCleared'] as int?) ?? 0,
+      dungeonClearCount: (json['dungeonClearCount'] as int?) ?? 0,
+      dungeonClearedToday: (json['dungeonClearedToday'] as int?) ?? 0,
+      idleCollectedToday: (json['idleCollectedToday'] as int?) ?? 0,
+      newDallimmonToday: (json['newDallimmonToday'] as int?) ?? 0,
+      questResetDate: (json['questResetDate'] as String?) ?? '',
+      dallimmons: dallimmons,
+      activeDallimmonIndex: (json['activeDallimmonIndex'] as int?) ?? 0,
+      eggs: (json['eggs'] as List<dynamic>?)
+              ?.map((e) => Egg.fromJson(e as Map<String, dynamic>))
+              .toList() ??
+          [],
+      partyIndices: (json['partyIndices'] as List<dynamic>?)
+              ?.map((i) => i as int)
+              .toList() ??
+          [0],
+      pvpPoints: (json['pvpPoints'] as int?) ?? 1000,
+      victoryTokens: (json['victoryTokens'] as int?) ?? 0,
+    );
+  }
 }
 
 // ── GameNotifier ──────────────────────────────────────────
@@ -140,10 +196,23 @@ class GameNotifier extends StateNotifier<GameState> {
   Timer? _idleTimer;
   SharedPreferences? _prefs;
   bool _loaded = false;
+  String? _uid;
 
   Future<void> _init() async {
     _prefs = await SharedPreferences.getInstance();
+    
+    // 1. 익명 로그인 시도
+    try {
+      final userCredential = await FirebaseAuth.instance.signInAnonymously();
+      _uid = userCredential.user?.uid;
+      print("👤 [인증 성공] 익명 사용자 UID: $_uid");
+    } catch (e) {
+      print("❌ [인증 실패] 익명 로그인을 할 수 없습니다: $e");
+    }
+
+    // 2. 데이터 로드 (로컬 -> 서버 순)
     await _load();
+    
     _loaded = true;
     _checkQuestReset();
     _calculateOfflineExp();
@@ -416,72 +485,58 @@ class GameNotifier extends StateNotifier<GameState> {
     final prefs = _prefs;
     if (prefs == null) return;
 
-    final data = {
-      'onboardingDone': state.onboardingDone,
-      'playerLevel': state.playerLevel,
-      'playerExp': state.playerExp,
-      'totalSteps': state.totalSteps,
-      'todaySteps': state.todaySteps,
-      'normalTickets': state.normalTickets,
-      'highestDungeonCleared': state.highestDungeonCleared,
-      'dungeonClearCount': state.dungeonClearCount,
-      'dungeonClearedToday': state.dungeonClearedToday,
-      'idleCollectedToday': state.idleCollectedToday,
-      'newDallimmonToday': state.newDallimmonToday,
-      'questResetDate': state.questResetDate,
-      'dallimmons': state.dallimmons.map((d) => d.toJson()).toList(),
-      'activeDallimmonIndex': state.activeDallimmonIndex,
-      'eggs': state.eggs.map((e) => e.toJson()).toList(),
-      'partyIndices': state.partyIndices,
-      'pvpPoints': state.pvpPoints,
-      'victoryTokens': state.victoryTokens,
-    };
-    await prefs.setString('game_state', jsonEncode(data));
+    final data = state.toJson();
+    final jsonStr = jsonEncode(data);
+    
+    // 1. 로컬 저장
+    await prefs.setString('game_state', jsonStr);
     _saveLastOnline();
+
+    // 2. 서버 저장 (UID가 있을 때만)
+    if (_uid != null) {
+      FirebaseFirestore.instance
+          .collection('users')
+          .doc(_uid)
+          .set(data, SetOptions(merge: true))
+          .then((_) => print("☁️ [클라우드 저장] 서버 동기화 완료"))
+          .catchError((e) => print("❌ [클라우드 저장 실패] $e"));
+    }
   }
 
   Future<void> _load() async {
     final prefs = _prefs;
     if (prefs == null) return;
 
-    final raw = prefs.getString('game_state');
-    if (raw == null) return;
+    // 1. 먼저 로컬 데이터 읽기
+    final localRaw = prefs.getString('game_state');
+    if (localRaw != null) {
+      try {
+        state = GameState.fromJson(jsonDecode(localRaw));
+        print("💾 [로컬 로드] 기기에서 데이터를 불러왔습니다.");
+      } catch (e) {
+        print("⚠️ [로컬 로드 실패] 데이터가 손상되었습니다: $e");
+      }
+    }
 
-    try {
-      final json = jsonDecode(raw) as Map<String, dynamic>;
-      final dallimmons = (json['dallimmons'] as List<dynamic>?)
-              ?.map((d) => OwnedDallimmon.fromJson(d as Map<String, dynamic>))
-              .toList() ??
-          [];
-
-      state = GameState(
-        onboardingDone: (json['onboardingDone'] as bool?) ?? false,
-        playerLevel: (json['playerLevel'] as int?) ?? 1,
-        playerExp: (json['playerExp'] as int?) ?? 0,
-        totalSteps: (json['totalSteps'] as int?) ?? 0,
-        todaySteps: (json['todaySteps'] as int?) ?? 0,
-        normalTickets: (json['normalTickets'] as int?) ?? 3,
-        highestDungeonCleared: (json['highestDungeonCleared'] as int?) ?? 0,
-        dungeonClearCount: (json['dungeonClearCount'] as int?) ?? 0,
-        dungeonClearedToday: (json['dungeonClearedToday'] as int?) ?? 0,
-        idleCollectedToday: (json['idleCollectedToday'] as int?) ?? 0,
-        newDallimmonToday: (json['newDallimmonToday'] as int?) ?? 0,
-        questResetDate: (json['questResetDate'] as String?) ?? '',
-        dallimmons: dallimmons,
-        activeDallimmonIndex: (json['activeDallimmonIndex'] as int?) ?? 0,
-        eggs: (json['eggs'] as List<dynamic>?)
-                ?.map((e) => Egg.fromJson(e as Map<String, dynamic>))
-                .toList() ??
-            [],
-        partyIndices: (json['partyIndices'] as List<dynamic>?)
-                ?.map((i) => i as int)
-                .toList() ??
-            [0],
-        pvpPoints: (json['pvpPoints'] as int?) ?? 1000,
-        victoryTokens: (json['victoryTokens'] as int?) ?? 0,
-      );
-    } catch (_) {
-      // Corrupt save - reset
+    // 2. 서버 데이터 확인 (병합 또는 덮어쓰기)
+    if (_uid != null) {
+      try {
+        final serverDoc = await FirebaseFirestore.instance.collection('users').doc(_uid).get();
+        if (serverDoc.exists && serverDoc.data() != null) {
+          final serverState = GameState.fromJson(serverDoc.data()!);
+          
+          // 만약 서버의 레벨이나 스테이지 진행도가 더 높다면 서버 데이터 우선
+          if (serverState.playerLevel > state.playerLevel || 
+              serverState.highestDungeonCleared > state.highestDungeonCleared) {
+            state = serverState;
+            print("☁️ [클라우드 로드] 서버 데이터를 우선 적용했습니다.");
+            // 로컬도 서버 데이터로 갱신
+            await prefs.setString('game_state', jsonEncode(state.toJson()));
+          }
+        }
+      } catch (e) {
+        print("❌ [클라우드 로드 실패] 서버 데이터를 가져오지 못했습니다: $e");
+      }
     }
   }
 

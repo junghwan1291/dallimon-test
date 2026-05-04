@@ -16,6 +16,11 @@ dependencies:
   flutter_map: ^6.1.0
   latlong2: ^0.9.0
   geolocator: ^11.0.0
+  flutter_map_cancellable_tile_provider: ^2.0.0
+  firebase_core: ^4.7.0
+  cloud_firestore: ^6.3.0
+  geoflutterfire_plus: ^0.0.34
+  firebase_auth: ^6.4.0
 
 dev_dependencies:
   flutter_test:
@@ -24,3 +29,5 @@ dev_dependencies:
 
 flutter:
   uses-material-design: true
+  assets:
+    - assets/images/

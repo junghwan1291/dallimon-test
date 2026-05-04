@@ -1,7 +1,9 @@
+import 'dart:async';
 import 'dart:math';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_map/flutter_map.dart';
+import 'package:flutter_map_cancellable_tile_provider/flutter_map_cancellable_tile_provider.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:geolocator/geolocator.dart';
 
@@ -11,6 +13,8 @@ import '../domain/dungeon.dart';
 import '../domain/pet_type.dart';
 import '../state/game_notifier.dart';
 import 'dungeon_battle_screen.dart';
+import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:geoflutterfire_plus/geoflutterfire_plus.dart';
 import 'pvp_battle_screen.dart';
 
 class MapDungeonScreen extends ConsumerStatefulWidget {
@@ -20,8 +24,14 @@ class MapDungeonScreen extends ConsumerStatefulWidget {
   ConsumerState<MapDungeonScreen> createState() => _MapDungeonScreenState();
 }
 
-class _MapDungeonScreenState extends ConsumerState<MapDungeonScreen> with SingleTickerProviderStateMixin {
+class _MapDungeonScreenState extends ConsumerState<MapDungeonScreen> with TickerProviderStateMixin {
   late AnimationController _pulseController;
+  late AnimationController _moveController;
+  LatLng? _animStartLocation;
+  LatLng? _animTargetLocation;
+  Timer? _moveTimer;
+  StreamSubscription? _raidSubscription;
+
   bool _isSearching = true;
   bool _isPvPMode = false;
   int _selectedIndex = 0;
@@ -32,6 +42,10 @@ class _MapDungeonScreenState extends ConsumerState<MapDungeonScreen> with Single
 
   final List<(String, String, String, String, PetType, String, LatLng)> _mapDungeons = [];
   final List<(PvPOpponent, LatLng)> _challengers = [];
+  (String, int, String, LatLng)? _raidBoss; // (이름, 레벨, 거리 문자열, 좌표)
+  bool _isRaidSelected = false;
+  List<Map<String, dynamic>> _serverRaidsData = []; // 반경 내 보스들 저장용
+
   bool _showNotice = true; // 공지사항 표시 여부 제어
 
   final List<(String, String, String, String, PetType)> _dungeonTemplates = [
@@ -50,7 +64,115 @@ class _MapDungeonScreenState extends ConsumerState<MapDungeonScreen> with Single
       duration: const Duration(seconds: 2),
     )..repeat();
 
+    _moveController = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 300),
+    )..addListener(() {
+        if (_animStartLocation != null && _animTargetLocation != null) {
+          final t = Curves.easeInOutCubic.transform(_moveController.value);
+          final lat = _animStartLocation!.latitude + (_animTargetLocation!.latitude - _animStartLocation!.latitude) * t;
+          final lng = _animStartLocation!.longitude + (_animTargetLocation!.longitude - _animStartLocation!.longitude) * t;
+          setState(() {
+            _currentLocation = LatLng(lat, lng);
+            _mapController.move(_currentLocation!, _mapController.camera.zoom);
+            _updateDistances();
+          });
+        }
+      });
+
     _initLocation();
+    _subscribeToWorldRaids();
+  }
+
+  void _subscribeToWorldRaids() {
+    if (_currentLocation == null) return;
+    
+    print("📡 [서버 연결 시도] 내 위치 주변 5km 레이드 스캔 중..."); 
+
+    final geoCollection = GeoCollectionReference(FirebaseFirestore.instance.collection('world_raids'));
+    
+    _raidSubscription?.cancel();
+    _raidSubscription = geoCollection.subscribeWithin(
+      center: GeoFirePoint(GeoPoint(_currentLocation!.latitude, _currentLocation!.longitude)),
+      radiusInKm: 5.0,
+      field: 'geo',
+      geopointFrom: (data) => (data['geo'] as Map<String, dynamic>)['geopoint'] as GeoPoint,
+      queryBuilder: (query) => query.where('status', isEqualTo: 'active'),
+      strictMode: true,
+    ).listen((docs) {
+      print("🔥 [서버 데이터 수신] 5km 반경 내 보스 마리 수: ${docs.length}"); 
+      _serverRaidsData = docs.map((d) => d.data() as Map<String, dynamic>).toList();
+      _updateRaidBossFromData();
+    }, onError: (error) {
+      print("❌ [Firestore 에러] 원인: $error"); 
+    });
+  }
+
+  void _updateRaidBossFromData() {
+    if (_serverRaidsData.isEmpty || _currentLocation == null) {
+      setState(() => _raidBoss = null);
+      return;
+    }
+
+    Map<String, dynamic>? closestRaid;
+    double minDistance = double.infinity;
+    LatLng? closestPos;
+
+    for (final data in _serverRaidsData) {
+      double raidLat = 0;
+      double raidLng = 0;
+
+      if (data['location'] is GeoPoint) {
+        GeoPoint gp = data['location'];
+        raidLat = gp.latitude;
+        raidLng = gp.longitude;
+      } else if (data['location'] is Map) {
+        final loc = data['location'] as Map;
+        GeoPoint? nestedGp;
+        loc.forEach((key, value) {
+          if (value is GeoPoint) nestedGp = value;
+        });
+
+        if (nestedGp != null) {
+          raidLat = nestedGp!.latitude;
+          raidLng = nestedGp!.longitude;
+        } else {
+          final latVal = loc['lat'] ?? loc['latitude'];
+          final lngVal = loc['lng'] ?? loc['longitude'];
+          if (latVal != null && lngVal != null) {
+            raidLat = (latVal as num).toDouble();
+            raidLng = (lngVal as num).toDouble();
+          } else {
+            continue; // 좌표 오류 패스
+          }
+        }
+      } else {
+        continue; // 형식 오류 패스
+      }
+
+      double dLat = (_currentLocation!.latitude - raidLat) * 111000;
+      double dLng = (_currentLocation!.longitude - raidLng) * 111000 * cos(_currentLocation!.latitude * pi / 180);
+      double dist = sqrt(dLat * dLat + dLng * dLng);
+
+      if (dist < minDistance) {
+        minDistance = dist;
+        closestRaid = data;
+        closestPos = LatLng(raidLat, raidLng);
+      }
+    }
+
+    if (closestRaid != null && closestPos != null) {
+      setState(() {
+        _raidBoss = (
+          closestRaid!['bossName'] ?? '미지의 보스',
+          (closestRaid!['level'] as num?)?.toInt() ?? 1,
+          '${minDistance.toInt()}m',
+          closestPos!
+        );
+      });
+    } else {
+      setState(() => _raidBoss = null);
+    }
   }
 
   Future<void> _initLocation() async {
@@ -90,6 +212,7 @@ class _MapDungeonScreenState extends ConsumerState<MapDungeonScreen> with Single
     }
     
     _generateSurroundingEntities();
+    _subscribeToWorldRaids();
     
     if (mounted) {
       setState(() => _isSearching = false);
@@ -100,56 +223,109 @@ class _MapDungeonScreenState extends ConsumerState<MapDungeonScreen> with Single
     // 강남역 부근 Fallback
     _currentLocation = const LatLng(37.498095, 127.027610);
     _generateSurroundingEntities();
+    _subscribeToWorldRaids();
     if (mounted) {
       setState(() => _isSearching = false);
     }
   }
   
+  bool _isTooClose(LatLng pos, double minRadius) {
+    if (_currentLocation == null) return true;
+    
+    // 플레이어와의 거리 체크
+    double dLatP = (_currentLocation!.latitude - pos.latitude) * 111000;
+    double dLngP = (_currentLocation!.longitude - pos.longitude) * 111000 * cos(_currentLocation!.latitude * pi / 180);
+    if (sqrt(dLatP*dLatP + dLngP*dLngP) < minRadius) return true;
+
+    // 다른 던전과의 거리 체크
+    for (var existing in _mapDungeons) {
+      double dLat = (existing.$7.latitude - pos.latitude) * 111000;
+      double dLng = (existing.$7.longitude - pos.longitude) * 111000 * cos(_currentLocation!.latitude * pi / 180);
+      if (sqrt(dLat*dLat + dLng*dLng) < minRadius) return true;
+    }
+    // 도전자와의 거리 체크
+    for (var existing in _challengers) {
+      double dLat = (existing.$2.latitude - pos.latitude) * 111000;
+      double dLng = (existing.$2.longitude - pos.longitude) * 111000 * cos(_currentLocation!.latitude * pi / 180);
+      if (sqrt(dLat*dLat + dLng*dLng) < minRadius) return true;
+    }
+    return false;
+  }
+
   void _generateSurroundingEntities() {
     if (_currentLocation == null) return;
     
-    final random = Random();
     _mapDungeons.clear();
     _challengers.clear();
+    _raidBoss = null;
     
     // BUG FIX: 선택된 인덱스 초기화 방지 로직 (범위 밖 접근 방지)
-    _selectedIndex = 0; 
+    _selectedIndex = 0;
+    _isRaidSelected = false;
     
-    // Generate 5-8 wild dallimmons within 500m
-    int wildCount = 5 + random.nextInt(4);
-    for (int i = 0; i < wildCount; i++) {
-      var t = _dungeonTemplates[random.nextInt(_dungeonTemplates.length)];
-      double dist = random.nextDouble() * 500;
-      double angle = random.nextDouble() * pi * 2;
-      double latOffset = (dist * cos(angle)) / 111000;
-      double lngOffset = (dist * sin(angle)) / (111000 * cos(_currentLocation!.latitude * pi / 180));
-      LatLng pos = LatLng(_currentLocation!.latitude + latOffset, _currentLocation!.longitude + lngOffset);
-      _mapDungeons.add((t.$1, t.$2, t.$3, t.$4, t.$5, '${dist.toInt()}m', pos));
-    }
+    final lat = _currentLocation!.latitude;
+    final lng = _currentLocation!.longitude;
+    final today = DateTime.now().day;
     
-    // Generate 3 challengers
-    for (int i = 0; i < 3; i++) {
-      double dist = 100 + random.nextDouble() * 400;
-      double angle = random.nextDouble() * pi * 2;
-      double latOffset = (dist * cos(angle)) / 111000;
-      double lngOffset = (dist * sin(angle)) / (111000 * cos(_currentLocation!.latitude * pi / 180));
-      LatLng pos = LatLng(_currentLocation!.latitude + latOffset, _currentLocation!.longitude + lngOffset);
-      
-      var opp = PvPOpponent(
-        name: '도전자 ${i+1}', 
-        level: 5 + random.nextInt(20), 
-        team: [
-          OwnedDallimmon(defId: random.nextInt(10), level: random.nextInt(20) + 1),
-          OwnedDallimmon(defId: random.nextInt(10), level: random.nextInt(20) + 1),
-        ]
-      );
-      _challengers.add((opp, pos));
+    // 격자 크기 설정 (약 100m)
+    final double gridLat = 0.0009;
+    final double gridLng = 0.0009 / cos(lat * pi / 180);
+    
+    final int centerGridX = (lat / gridLat).floor();
+    final int centerGridY = (lng / gridLng).floor();
+    
+    // 주변 10x10 격자 순회 (반경 약 500m)
+    for (int dx = -5; dx <= 5; dx++) {
+      for (int dy = -5; dy <= 5; dy++) {
+        int gx = centerGridX + dx;
+        int gy = centerGridY + dy;
+        
+        // 고유 시드 생성 (격자 X좌표 + 격자 Y좌표 + 오늘 날짜)
+        int seed = gx ^ (gy << 16) ^ today;
+        Random r = Random(seed);
+        
+        double chance = r.nextDouble();
+        
+        // 격자 내에서 몬스터가 뜰 고정된 위치 (셀 중앙부 40% 구역 안에서 랜덤)
+        // 이를 통해 던전 간 겹침이 수학적으로 발생하지 않음 (최소 60m 이상 이격 보장)
+        double spawnLat = (gx + 0.3 + r.nextDouble() * 0.4) * gridLat;
+        double spawnLng = (gy + 0.3 + r.nextDouble() * 0.4) * gridLng;
+        LatLng pos = LatLng(spawnLat, spawnLng);
+        
+        // 플레이어와의 거리 계산
+        double distLat = (lat - spawnLat) * 111000;
+        double distLng = (lng - spawnLng) * 111000 * cos(lat * pi / 180);
+        double distMeters = sqrt(distLat*distLat + distLng*distLng);
+        
+        if (distMeters > 500) continue; // 500m 밖은 무시
+        
+        if (chance < 0.25) {
+          // 25% 확률로 던전 스폰
+          var t = _dungeonTemplates[r.nextInt(_dungeonTemplates.length)];
+          _mapDungeons.add((t.$1, t.$2, t.$3, t.$4, t.$5, '${distMeters.toInt()}m', pos));
+        } else if (chance < 0.35) {
+          // 10% 확률로 도전자 스폰
+          var opp = PvPOpponent(
+            name: '도전자 ${gx.abs() % 100}${gy.abs() % 100}', 
+            level: 5 + r.nextInt(20), 
+            team: [
+              OwnedDallimmon(defId: r.nextInt(10), level: r.nextInt(20) + 1),
+              OwnedDallimmon(defId: r.nextInt(10), level: r.nextInt(20) + 1),
+            ]
+          );
+          _challengers.add((opp, pos));
+        }
+      }
     }
+    // 기존 임시 랜덤 레이드 보스 생성 로직 제거 (이제 서버 데이터를 사용함)
   }
 
   @override
   void dispose() {
     _pulseController.dispose();
+    _moveController.dispose();
+    _moveTimer?.cancel();
+    _raidSubscription?.cancel();
     super.dispose();
   }
 
@@ -331,6 +507,14 @@ class _MapDungeonScreenState extends ConsumerState<MapDungeonScreen> with Single
                 ],
               ),
             ),
+            
+          // 5. Movement Test D-Pad
+          if (_currentLocation != null && !_isSearching)
+            Positioned(
+              left: 16,
+              bottom: 340, // 하단 UI 위쪽
+              child: _buildDPad(),
+            ),
         ],
       ),
     );
@@ -352,6 +536,124 @@ class _MapDungeonScreenState extends ConsumerState<MapDungeonScreen> with Single
         child: Icon(icon, color: Colors.white, size: 24),
       ),
     );
+  }
+
+  // ── Test D-Pad ───────────────────────────────────────────
+  void _startContinuousMove(double dx, double dy) {
+    _moveLocationScreen(dx, dy); // 처음 한 번 이동
+    _moveTimer?.cancel();
+    _moveTimer = Timer.periodic(const Duration(milliseconds: 300), (_) {
+      _moveLocationScreen(dx, dy);
+    });
+  }
+
+  void _stopContinuousMove() {
+    _moveTimer?.cancel();
+    _moveTimer = null;
+  }
+
+  Widget _buildDPad() {
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.black87,
+        borderRadius: BorderRadius.circular(40),
+        border: Border.all(color: AppColors.cardBorder),
+      ),
+      padding: const EdgeInsets.all(8),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _dPadButton(Icons.north_west, () => _startContinuousMove(-0.0000135, 0.0000135), _stopContinuousMove),
+              const SizedBox(width: 4),
+              _dPadButton(Icons.arrow_upward, () => _startContinuousMove(0, 0.0000135), _stopContinuousMove),
+              const SizedBox(width: 4),
+              _dPadButton(Icons.north_east, () => _startContinuousMove(0.0000135, 0.0000135), _stopContinuousMove),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _dPadButton(Icons.arrow_back, () => _startContinuousMove(-0.0000135, 0), _stopContinuousMove),
+              const SizedBox(width: 44, height: 40), // 중앙 빈 공간
+              _dPadButton(Icons.arrow_forward, () => _startContinuousMove(0.0000135, 0), _stopContinuousMove),
+            ],
+          ),
+          const SizedBox(height: 4),
+          Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _dPadButton(Icons.south_west, () => _startContinuousMove(-0.0000135, -0.0000135), _stopContinuousMove),
+              const SizedBox(width: 4),
+              _dPadButton(Icons.arrow_downward, () => _startContinuousMove(0, -0.0000135), _stopContinuousMove),
+              const SizedBox(width: 4),
+              _dPadButton(Icons.south_east, () => _startContinuousMove(0.0000135, -0.0000135), _stopContinuousMove),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _dPadButton(IconData icon, VoidCallback onStart, VoidCallback onStop) {
+    return GestureDetector(
+      onTapDown: (_) => onStart(),
+      onTapUp: (_) => onStop(),
+      onTapCancel: () => onStop(),
+      child: Container(
+        padding: const EdgeInsets.all(8),
+        decoration: BoxDecoration(
+          color: AppColors.primary.withOpacity(0.8),
+          shape: BoxShape.circle,
+        ),
+        child: Icon(icon, color: Colors.white, size: 24),
+      ),
+    );
+  }
+
+  void _moveLocationScreen(double dx, double dy) {
+    if (_currentLocation == null) return;
+    
+    // 현재 카메라 회전값(도)을 라디안으로 변환
+    // 쿼터뷰에서 화면의 상하좌우가 실제 지도의 방향과 맞도록 보정
+    double r = -_currentRotation * pi / 180; 
+    
+    double latOffset = dy * cos(r) - dx * sin(r);
+    // 경도는 위도에 따라 거리가 달라지므로 cos(latitude)로 보정
+    double lngOffset = (dx * cos(r) + dy * sin(r)) / cos(_currentLocation!.latitude * pi / 180);
+    
+    _animStartLocation = _currentLocation;
+    _animTargetLocation = LatLng(
+      _currentLocation!.latitude + latOffset, 
+      _currentLocation!.longitude + lngOffset
+    );
+    
+    _moveController.forward(from: 0.0);
+    
+    // 실제 걸음 수 반영 (+2보) -> EXP 획득, 알 부화, 퀘스트 등에 자동 적용됨
+    ref.read(gameProvider.notifier).addSteps(2);
+  }
+
+  void _updateDistances() {
+    if (_currentLocation == null) return;
+    
+    for (int i = 0; i < _mapDungeons.length; i++) {
+      var d = _mapDungeons[i];
+      // 간단한 피타고라스 거리 계산 (m 단위 근사치)
+      double latDiff = (d.$7.latitude - _currentLocation!.latitude) * 111000;
+      double lngDiff = (d.$7.longitude - _currentLocation!.longitude) * 111000 * cos(_currentLocation!.latitude * pi / 180);
+      double dist = sqrt(latDiff * latDiff + lngDiff * lngDiff);
+      
+      _mapDungeons[i] = (d.$1, d.$2, d.$3, d.$4, d.$5, '${dist.toInt()}m', d.$7);
+    }
+
+    // 반경 5km 스캔 리스트가 있다면 다시 갱신
+    if (_serverRaidsData.isNotEmpty) {
+      _updateRaidBossFromData();
+    }
   }
 
   // ── Top stats bar (From old home_screen) ─────────────────
@@ -487,11 +789,21 @@ class _MapDungeonScreenState extends ConsumerState<MapDungeonScreen> with Single
                 Transform(
                   alignment: Alignment.bottomCenter,
                   transform: Matrix4.identity()..rotateX(-mapTilt),
-                  child: const Column(
+                  child: Column(
                     mainAxisSize: MainAxisSize.min,
                     children: [
-                      Icon(Icons.keyboard_arrow_down, color: AppColors.primary, size: 30),
-                      Icon(Icons.person_pin_circle, color: AppColors.primary, size: 40),
+                      const Icon(Icons.keyboard_arrow_down, color: AppColors.primary, size: 30),
+                      // 튜토리얼용 2.5D 스프라이트 GIF 적용 예시
+                      // 실제 게임에서는 Image.asset('assets/images/my_character.gif') 로 변경하시면 됩니다!
+                      Image.network(
+                        'https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon/versions/generation-v/black-white/animated/25.gif',
+                        width: 60,
+                        height: 60,
+                        fit: BoxFit.contain,
+                        errorBuilder: (context, error, stackTrace) {
+                          return const Icon(Icons.person_pin_circle, color: AppColors.primary, size: 40);
+                        },
+                      ),
                     ],
                   ),
                 ),
@@ -517,22 +829,27 @@ class _MapDungeonScreenState extends ConsumerState<MapDungeonScreen> with Single
 
       final m = Marker(
         point: pos,
-        width: 80,
-        height: 120, // 높이를 넉넉하게 주어 텍스트와 박스가 잘리거나 어긋나지 않게 함
+        width: 100, // 너비를 넉넉하게 주어 오버플로우 방지
+        height: 160, // 던전 이미지 교체 후 약간 커진 전체 높이(142px)를 커버하기 위해 160으로 여유 할당
         alignment: Alignment.topCenter,
         rotate: true,
-        child: GestureDetector(
-          onTap: () {
-            setState(() => _selectedIndex = i);
-          },
-          child: Transform(
-            alignment: Alignment.bottomCenter,
-            transform: Matrix4.identity()..rotateX(-mapTilt),
-            child: _Pseudo3DMarker(
-              emoji: emoji,
-              color: typeColor,
-              isSelected: isSelected,
-              distance: distanceStr,
+        child: RepaintBoundary( // <--- 회전 시 렉 최소화를 위한 렌더링 캐싱
+          child: GestureDetector(
+            onTap: () {
+              setState(() {
+                _selectedIndex = i;
+                _isRaidSelected = false;
+              });
+            },
+            child: Transform(
+              alignment: Alignment.bottomCenter,
+              transform: Matrix4.identity()..rotateX(-mapTilt),
+              child: _Pseudo3DMarker(
+                emoji: emoji,
+                color: typeColor,
+                isSelected: isSelected,
+                distance: distanceStr,
+              ),
             ),
           ),
         ),
@@ -550,6 +867,43 @@ class _MapDungeonScreenState extends ConsumerState<MapDungeonScreen> with Single
       markers.add(selectedMarker);
     }
 
+    // 레이드 보스 마커 추가
+    if (_raidBoss != null) {
+      final raidM = Marker(
+        point: _raidBoss!.$4,
+        width: 140, // 거대 보스이므로 너비를 넓게
+        height: 200, // 높이도 넓게
+        alignment: Alignment.topCenter,
+        rotate: true,
+        child: RepaintBoundary(
+          child: GestureDetector(
+            onTap: () {
+              setState(() {
+                _isRaidSelected = true;
+                // 기존 다른 선택 해제
+                // _selectedIndex = 0; // 이건 딱히 의미 없을지도
+              });
+            },
+            child: Transform(
+              alignment: Alignment.bottomCenter,
+              transform: Matrix4.identity()..rotateX(-mapTilt),
+              child: _RaidMarker(
+                distance: _raidBoss!.$3,
+                isSelected: _isRaidSelected,
+              ),
+            ),
+          ),
+        ),
+      );
+      
+      // 선택된 경우 가장 위에 그리도록
+      if (_isRaidSelected) {
+        markers.add(raidM);
+      } else {
+        markers.insert(1, raidM); // 본인 위치 바로 다음으로 (다른 것들 아래)
+      }
+    }
+
     return Listener(
       onPointerMove: (event) {
         if (event.delta.dx.abs() > 0.1) {
@@ -562,8 +916,8 @@ class _MapDungeonScreenState extends ConsumerState<MapDungeonScreen> with Single
         return Transform.translate(
           offset: const Offset(0, -60), // 캐릭터가 하단 UI에 가려지지 않도록 위로 시프트
           child: OverflowBox(
-            maxWidth: constraints.maxWidth * 2.0, // Make the map render larger
-            maxHeight: constraints.maxHeight * 2.5,
+            maxWidth: constraints.maxWidth * 1.5, // 회전 렉 방지를 위해 불필요하게 넓은 공간 축소 (기존 2.0 -> 1.5)
+            maxHeight: constraints.maxHeight * 1.9, // 기존 2.5 -> 1.9
             child: Transform(
               alignment: FractionalOffset.center,
               transform: Matrix4.identity()
@@ -584,6 +938,7 @@ class _MapDungeonScreenState extends ConsumerState<MapDungeonScreen> with Single
                   urlTemplate: 'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}.png',
                   subdomains: const ['a', 'b', 'c', 'd'],
                   userAgentPackageName: 'com.example.dallimon_app',
+                  tileProvider: CancellableNetworkTileProvider(),
                 ),
                 MarkerLayer(markers: markers),
               ],
@@ -631,18 +986,27 @@ class _MapDungeonScreenState extends ConsumerState<MapDungeonScreen> with Single
   }
 
   Widget _buildFoundOverlay() {
+    if (_isRaidSelected && _raidBoss != null) {
+      return _buildRaidOverlay();
+    }
+
     final count = _isPvPMode ? _challengers.length : _mapDungeons.length;
     final typeText = _isPvPMode ? '도전자' : '던전';
 
     if (count == 0) return const SizedBox();
 
     return Container(
-      decoration: const BoxDecoration(
-        gradient: LinearGradient(
-          begin: Alignment.bottomCenter,
-          end: Alignment.topCenter,
-          colors: [Colors.black, Colors.transparent],
-        ),
+      width: double.infinity,
+      decoration: BoxDecoration(
+        color: Colors.black.withOpacity(0.85),
+        borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.3),
+            blurRadius: 10,
+            offset: const Offset(0, -2),
+          ),
+        ],
       ),
       padding: const EdgeInsets.fromLTRB(20, 10, 20, 20), // 상단 패딩 살짝 조절
       child: Column(
@@ -657,6 +1021,79 @@ class _MapDungeonScreenState extends ConsumerState<MapDungeonScreen> with Single
           _buildDungeonInfoSection(),
           const SizedBox(height: 16),
           _buildBattleButton(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildRaidOverlay() {
+    return Container(
+      width: double.infinity,
+      decoration: BoxDecoration(
+        color: Colors.black.withOpacity(0.9),
+        borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
+        border: Border(top: BorderSide(color: Colors.red.shade900, width: 2)),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.red.withOpacity(0.3),
+            blurRadius: 15,
+            offset: const Offset(0, -2),
+          ),
+        ],
+      ),
+      padding: const EdgeInsets.fromLTRB(20, 20, 20, 24),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.whatshot, color: Colors.redAccent, size: 36),
+              const SizedBox(width: 14),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    const Text('🔴 월드 레이드 출현!', style: TextStyle(color: Colors.redAccent, fontWeight: FontWeight.w900, fontSize: 13, letterSpacing: -0.5)),
+                    const SizedBox(height: 2),
+                    Text(
+                      '${_raidBoss!.$1} (Lv.${_raidBoss!.$2})',
+                      style: const TextStyle(color: Colors.white, fontSize: 18, fontWeight: FontWeight.bold),
+                    ),
+                  ],
+                ),
+              ),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(
+                  color: Colors.black54,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: Colors.redAccent.withOpacity(0.5)),
+                ),
+                child: Text(_raidBoss!.$3, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold, fontSize: 12)),
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          SizedBox(
+            width: double.infinity,
+            height: 48,
+            child: ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: Colors.red.shade800,
+                foregroundColor: Colors.white,
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                elevation: 5,
+                shadowColor: Colors.redAccent,
+              ),
+              onPressed: () {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(content: Text('레이드 전투는 업데이트 준비 중입니다!')),
+                );
+              },
+              child: const Text('레이드 입장', style: TextStyle(fontSize: 16, fontWeight: FontWeight.w900, letterSpacing: 1)),
+            ),
+          ),
         ],
       ),
     );
@@ -1064,22 +1501,64 @@ class _Pseudo3DMarker extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    bool isPvP = distance == 'PvP';
+
+    if (!isPvP) {
+      // 🌟 새로운 판타지 던전 이미지 모드
+      return Column(
+        mainAxisAlignment: MainAxisAlignment.end,
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          if (isSelected)
+            const Padding(
+              padding: EdgeInsets.only(bottom: 2),
+              child: Icon(Icons.keyboard_arrow_down, color: Colors.white, size: 36),
+            ),
+          // 거리 표시 라벨
+          Container(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+            decoration: BoxDecoration(
+              color: Colors.black.withOpacity(0.6),
+              borderRadius: BorderRadius.circular(8),
+            ),
+            child: Text(
+              distance,
+              style: const TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold),
+            ),
+          ),
+          const SizedBox(height: 4),
+          // 던전 3D 에셋 이미지 (테두리 및 배경 박스 모두 제거)
+          AnimatedContainer(
+            duration: const Duration(milliseconds: 200),
+            width: isSelected ? 80 : 64,
+            height: isSelected ? 80 : 64,
+            child: ColorFiltered(
+              // 속성 색상을 은은하게 입힘
+              colorFilter: ColorFilter.mode(color.withOpacity(0.3), BlendMode.srcATop),
+              child: Image.asset(
+                'assets/images/dungeon.png',
+                fit: BoxFit.contain, // 원형 클리핑 없이 이미지 원본 비율 유지
+              ),
+            ),
+          ),
+        ],
+      );
+    }
+
+    // 🧑 기존 PvP 도전자 모드 (박스 스타일 유지)
     return Column(
       mainAxisAlignment: MainAxisAlignment.end,
       mainAxisSize: MainAxisSize.min,
       children: [
-        // Selection Indicator
         if (isSelected)
           const Padding(
             padding: EdgeInsets.only(bottom: 2),
             child: Icon(Icons.keyboard_arrow_down, color: Colors.white, size: 36),
           ),
-
-        // Transparent Distance Label (Attached completely to the box)
         Container(
           padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
           decoration: BoxDecoration(
-            color: Colors.black.withOpacity(0.6), // 반투명 배경
+            color: Colors.black.withOpacity(0.6),
             borderRadius: const BorderRadius.only(topLeft: Radius.circular(8), topRight: Radius.circular(8)),
             border: Border.all(color: Colors.transparent, width: 0),
           ),
@@ -1088,20 +1567,18 @@ class _Pseudo3DMarker extends StatelessWidget {
             style: const TextStyle(color: Colors.white, fontSize: 10, fontWeight: FontWeight.bold),
           ),
         ),
-
-        // Marker Body
         AnimatedContainer(
           duration: const Duration(milliseconds: 200),
           width: isSelected ? 50 : 42,
           height: isSelected ? 66 : 56,
           decoration: BoxDecoration(
-            color: color.withOpacity(isSelected ? 0.9 : 0.6), // 선택 안 된 마커는 반투명하게
+            color: color.withOpacity(isSelected ? 0.9 : 0.6),
             borderRadius: const BorderRadius.only(
               topLeft: Radius.circular(4), 
               topRight: Radius.circular(4), 
               bottomLeft: Radius.circular(12), 
               bottomRight: Radius.circular(12)
-            ), // 텍스트 박스와 자연스럽게 연결되도록 위쪽 모서리 곡률 감소
+            ),
             boxShadow: [
               if (isSelected)
                 BoxShadow(color: color, blurRadius: 20, spreadRadius: 5),
@@ -1121,6 +1598,57 @@ class _Pseudo3DMarker extends StatelessWidget {
                 child: Text(emoji, style: TextStyle(fontSize: isSelected ? 20 : 16)),
               ),
             ),
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _RaidMarker extends StatelessWidget {
+  final bool isSelected;
+  final String distance;
+
+  const _RaidMarker({
+    required this.isSelected,
+    required this.distance,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Column(
+      mainAxisAlignment: MainAxisAlignment.end,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        if (isSelected)
+          const Padding(
+            padding: EdgeInsets.only(bottom: 2),
+            child: Icon(Icons.keyboard_arrow_down, color: Colors.redAccent, size: 40),
+          ),
+        Container(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+          decoration: BoxDecoration(
+            color: Colors.red.shade900.withOpacity(0.8),
+            borderRadius: BorderRadius.circular(8),
+            border: Border.all(color: Colors.redAccent, width: 2),
+            boxShadow: const [
+              BoxShadow(color: Colors.redAccent, blurRadius: 8),
+            ]
+          ),
+          child: Text(
+            'RAID: $distance',
+            style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold, letterSpacing: 1),
+          ),
+        ),
+        const SizedBox(height: 6),
+        // 레이드 에셋 (드래곤)
+        AnimatedContainer(
+          duration: const Duration(milliseconds: 200),
+          width: isSelected ? 120 : 96,
+          height: isSelected ? 120 : 96,
+          child: Image.asset(
+            'assets/images/dragon.png',
+            fit: BoxFit.contain,
           ),
         ),
       ],
